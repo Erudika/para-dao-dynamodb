@@ -48,7 +48,7 @@ para.dynamodb.max_write_capacity = 1
 
 Finally, set the config property:
 ```ini
-para.dao = "AWSDynamoDBDAO"
+para.dao = "AWSDynamoDAO"
 ```
 This could be a Java system property or part of a `application.conf` file on the classpath.
 This tells Para to use the DynamoDB `DAO` implementation instead of the default one.
