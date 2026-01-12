@@ -15,7 +15,9 @@
  *
  * For issues and patches go to: https://github.com/erudika
  */
-
+/**
+ * AWSDynamoDB DAO.
+ */
 module com.erudika.para.server.persistence.dynamodb {
 	requires com.erudika.para.core;
 	requires org.apache.commons.lang3;
