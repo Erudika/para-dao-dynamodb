@@ -333,7 +333,7 @@ public class AWSDynamoDAO implements DAO {
 			for (int i = 0; i < batchSteps; i++) {
 				while (it.hasNext() && j < MAX_KEYS_PER_READ) {
 					String key = it.next();
-					results.put(key, null);
+					//results.put(key, null);
 					if (!StringUtils.isBlank(key)) {
 						keyz.add(rowKey(key, appid));
 						j++;

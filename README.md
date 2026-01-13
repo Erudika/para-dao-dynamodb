@@ -3,7 +3,6 @@
 
 > ### Amazon DynamoDB DAO plugin for Para
 
-[![Build Status](https://travis-ci.org/Erudika/para-dao-dynamodb.svg?branch=master)](https://travis-ci.org/Erudika/para-dao-dynamodb)
 [![Maven Central Version](https://img.shields.io/maven-central/v/com.erudika/para-dao-dynamodb)](https://central.sonatype.com/artifact/com.erudika/para-dao-dynamodb)
 [![Join the chat at https://gitter.im/Erudika/para](https://badges.gitter.im/Erudika/para.svg)](https://gitter.im/Erudika/para?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 

@@ -7,7 +7,7 @@
 	<version>1.51.6-SNAPSHOT</version>
 
 	<packaging>jar</packaging>
-	<name>Para DynamoDB DAO</name>
+	<name>Para Amazon DynamoDB DAO</name>
 	<description>A plugin for Para which enables support for Amazon DynamoDB.</description>
 	<url>https://paraio.org</url>
 
@@ -60,7 +60,7 @@
 		<dependency>
 			<groupId>com.erudika</groupId>
 			<artifactId>para-core</artifactId>
-			<version>1.51.4</version>
+			<version>1.52.0</version>
 			<scope>provided</scope>
 		</dependency>
 
