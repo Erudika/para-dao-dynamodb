@@ -30,7 +30,6 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
@@ -87,7 +86,6 @@ public final class AWSDynamoUtils {
 	private static final String AWS_REGION = new DefaultAwsRegionProviderChain().getRegion().id();
 	private static Map<String, DynamoDbClient> ddbClients;
 	private static Map<String, ApplicationAutoScalingClient> aasClients;
-	private static List<String> replicaRegions;
 	private static final Logger logger = LoggerFactory.getLogger(AWSDynamoUtils.class);
 
 	static {
@@ -100,11 +98,11 @@ public final class AWSDynamoUtils {
 	 * Returns a client instance for AWS DynamoDB.
 	 * @return a client that talks to DynamoDB
 	 */
-	public static DynamoDbClient getClient() {
-		return getClient(AWS_REGION);
+	public static DynamoDbClient client() {
+		return client(AWS_REGION);
 	}
 
-	private static DynamoDbClient getClient(String region) {
+	private static DynamoDbClient client(String region) {
 		if (ddbClients != null && ddbClients.containsKey(region)) {
 			return ddbClients.get(region);
 		}
@@ -120,7 +118,7 @@ public final class AWSDynamoUtils {
 		if (ddbClients == null) {
 			ddbClients = new HashMap<>();
 			ddbClients.put(region, ddbClient);
-			getReplicaRegions().stream().filter(r -> !r.equals(region)).forEach(r -> {
+			Para.getConfig().replicaRegions().stream().filter(r -> !r.equals(region)).forEach(r -> {
 				ddbClients.put(r, DynamoDbClient.builder().region(Region.of(r)).build());
 			});
 		}
@@ -132,7 +130,7 @@ public final class AWSDynamoUtils {
 		if (aasClients == null) {
 			aasClients = new HashMap<>();
 			aasClients.put(region, ApplicationAutoScalingClient.create());
-			getReplicaRegions().stream().filter(r -> !r.equals(region)).forEach(r -> {
+			Para.getConfig().replicaRegions().stream().filter(r -> !r.equals(region)).forEach(r -> {
 				aasClients.put(r, ApplicationAutoScalingClient.builder().region(Region.of(r)).build());
 			});
 		}
@@ -164,7 +162,7 @@ public final class AWSDynamoUtils {
 			return false;
 		}
 		try {
-			DescribeTableResponse res = getClient().describeTable(b -> b.tableName(getTableNameForAppid(appid)));
+			DescribeTableResponse res = client().describeTable(b -> b.tableName(getTableNameForAppid(appid)));
 			return res != null;
 		} catch (Exception e) {
 			return false;
@@ -199,33 +197,34 @@ public final class AWSDynamoUtils {
 			return false;
 		}
 		String table = getTableNameForAppid(appid);
+		List<String> replicaRegions = Para.getConfig().replicaRegions();
 		boolean created = createTableInternal(appid, maxReadCapacity, maxWriteCapacity, AWS_REGION); // master replica
-		boolean replicate = !getReplicaRegions().isEmpty() && !App.isRoot(appid);
+		boolean replicate = !replicaRegions.isEmpty() && !App.isRoot(appid);
 		if (created && replicate) {
 			Para.asyncExecute(() -> {
 				List<Replica> replicas = new LinkedList<>();
 				// add master AND secondary replicas
 				replicas.add(Replica.builder().regionName(AWS_REGION).build());
 				// also create secondary replica tables, skipping the region of the master replica table
-				getReplicaRegions().stream().filter(r -> !r.equals(AWS_REGION)).forEach(region -> {
+				replicaRegions.stream().filter(r -> !r.equals(AWS_REGION)).forEach(region -> {
 					logger.info("Replicating DynamoDB table '{}' in region {}...", table, region);
 					replicas.add(Replica.builder().regionName(region).build());
 					createTableInternal(appid, maxReadCapacity, maxWriteCapacity, region);
 				});
 				// link master and secondary tables together in a global table relationship (multi-master replicas)
-				getClient().createGlobalTable(b -> b.globalTableName(table).replicationGroup(replicas));
+				client().createGlobalTable(b -> b.globalTableName(table).replicationGroup(replicas));
 			});
 		}
 		if (Para.getConfig().awsDynamoBackupsEnabled()) {
 			logger.info("Enabling backups for table '{}'...", table);
-			getClient().updateContinuousBackups((t) -> t.tableName(table).
+			client().updateContinuousBackups((t) -> t.tableName(table).
 					pointInTimeRecoverySpecification((p) -> p.pointInTimeRecoveryEnabled(true)));
 		}
 		return created;
 	}
 
 	private static boolean createTableInternal(String appid, int maxReadCapacity, int maxWriteCapacity, String region) {
-		boolean replicate = !getReplicaRegions().isEmpty() && !App.isRoot(appid);
+		boolean replicate = !Para.getConfig().replicaRegions().isEmpty() && !App.isRoot(appid);
 		try {
 			String table = getTableNameForAppid(appid);
 			CreateTableRequest.Builder ctr = CreateTableRequest.builder().tableName(table).
@@ -245,7 +244,7 @@ public final class AWSDynamoUtils {
 				ctr.billingMode(BillingMode.PAY_PER_REQUEST);
 			}
 
-			CreateTableResponse tbl = getClient(region).createTable(ctr.build());
+			CreateTableResponse tbl = AWSDynamoUtils.client(region).createTable(ctr.build());
 			waitForActive(table, region);
 			logger.info("Created DynamoDB table '{}', status {}.", table, tbl.tableDescription().tableStatus());
 
@@ -301,7 +300,7 @@ public final class AWSDynamoUtils {
 		String table = getTableNameForAppid(appid);
 		try {
 			// AWS throws an exception if the new read/write capacity values are the same as the current ones
-			getClient().updateTable(b -> b.tableName(table).
+			client().updateTable(b -> b.tableName(table).
 					provisionedThroughput(b1 -> b1.readCapacityUnits(readCapacity).writeCapacityUnits(writeCapacity)));
 			return true;
 		} catch (Exception e) {
@@ -322,26 +321,27 @@ public final class AWSDynamoUtils {
 		}
 		try {
 			String table = getTableNameForAppid(appid);
-			if (!getReplicaRegions().isEmpty() && !App.isRoot(appid)) {
+			List<String> replicaRegions = Para.getConfig().replicaRegions();
+			if (!replicaRegions.isEmpty() && !App.isRoot(appid)) {
 				List<ReplicaUpdate> replicaUpdates = new LinkedList<>();
-				getReplicaRegions().stream().forEach(region -> {
+				replicaRegions.stream().forEach(region -> {
 					logger.info("Removing replica from global table '{}' in region {}...", table, region);
 					replicaUpdates.add(ReplicaUpdate.builder().delete(d -> d.regionName(region)).build());
 				});
 				try {
 					// this only removes the replicas for each region - it DOES NOT delete the actual replica tables
-					getClient().updateGlobalTable(b -> b.globalTableName(table).replicaUpdates(replicaUpdates));
+					client().updateGlobalTable(b -> b.globalTableName(table).replicaUpdates(replicaUpdates));
 				} catch (Exception ex) {
 					logger.error(null, ex);
 				} finally {
-					getReplicaRegions().stream().forEach(region -> {
+					replicaRegions.stream().forEach(region -> {
 						DynamoDbAsyncClient asyncdb = DynamoDbAsyncClient.builder().region(Region.of(region)).build();
 						asyncdb.deleteTable(b -> b.tableName(table));
 						logger.info("Deleted DynamoDB table '{}' in region {}.", table, region);
 					});
 				}
 			} else {
-				getClient().deleteTable(b -> b.tableName(table));
+				client().deleteTable(b -> b.tableName(table));
 				logger.info("Deleted DynamoDB table '{}'.", table);
 			}
 		} catch (Exception e) {
@@ -378,7 +378,7 @@ public final class AWSDynamoUtils {
 				AttributeDefinition.builder().attributeName(Config._ID).attributeType(ScalarAttributeType.S).build()
 			};
 
-			CreateTableResponse tbl = getClient().createTable(b -> b.tableName(table).
+			CreateTableResponse tbl = client().createTable(b -> b.tableName(table).
 					keySchema(KeySchemaElement.builder().attributeName(Config._KEY).keyType(KeyType.HASH).build()).
 					sseSpecification(b2 -> b2.enabled(Para.getConfig().awsDynamoEncryptionEnabled())).
 					attributeDefinitions(attributes).
@@ -389,7 +389,7 @@ public final class AWSDynamoUtils {
 			logger.info("Created shared table '{}', status {}.", table, tbl.tableDescription().tableStatus());
 			if (Para.getConfig().awsDynamoBackupsEnabled()) {
 				logger.info("Enabling backups for shared table '{}'...", table);
-				getClient().updateContinuousBackups((t) -> t.tableName(table).
+				client().updateContinuousBackups((t) -> t.tableName(table).
 						pointInTimeRecoverySpecification((p) -> p.pointInTimeRecoveryEnabled(true)));
 			}
 		} catch (Exception e) {
@@ -409,7 +409,7 @@ public final class AWSDynamoUtils {
 			return Collections.emptyMap();
 		}
 		try {
-			final TableDescription td = getClient().describeTable(b -> b.tableName(getTableNameForAppid(appid))).table();
+			final TableDescription td = client().describeTable(b -> b.tableName(getTableNameForAppid(appid))).table();
 			HashMap<String, Object> dbStatus = new HashMap<>();
 			dbStatus.put("id", appid);
 			dbStatus.put("status", td.tableStatus().name());
@@ -431,7 +431,7 @@ public final class AWSDynamoUtils {
 	 */
 	public static List<String> listAllTables() {
 		int items = 100;
-		ListTablesResponse ltr = getClient().listTables(b -> b.limit(items));
+		ListTablesResponse ltr = client().listTables(b -> b.limit(items));
 		List<String> tables = new LinkedList<>();
 		do {
 			tables.addAll(ltr.tableNames());
@@ -440,7 +440,7 @@ public final class AWSDynamoUtils {
 				break;
 			}
 			final String lastKey = ltr.lastEvaluatedTableName();
-			ltr = getClient().listTables(b -> b.limit(items).exclusiveStartTableName(lastKey));
+			ltr = client().listTables(b -> b.limit(items).exclusiveStartTableName(lastKey));
 		} while (!ltr.tableNames().isEmpty());
 		return tables;
 	}
@@ -538,7 +538,7 @@ public final class AWSDynamoUtils {
 			return;
 		}
 		try {
-			BatchGetItemResponse result = getClient().batchGetItem(b -> b.
+			BatchGetItemResponse result = client().batchGetItem(b -> b.
 					returnConsumedCapacity(ReturnConsumedCapacity.TOTAL).requestItems(kna));
 			if (result == null) {
 				return;
@@ -593,7 +593,7 @@ public final class AWSDynamoUtils {
 		}
 		try {
 			logger.debug("batchWrite(): requests {}, backoff {}", items.values().iterator().next().size(), backoff);
-			BatchWriteItemResponse result = getClient().batchWriteItem(b -> b.
+			BatchWriteItemResponse result = client().batchWriteItem(b -> b.
 					returnConsumedCapacity(ReturnConsumedCapacity.TOTAL).requestItems(items));
 			if (result == null) {
 				return;
@@ -648,7 +648,7 @@ public final class AWSDynamoUtils {
 					singletonMap(Config._KEY, AttributeValue.builder().s(pager.getLastKey()).build()));
 		}
 
-		ScanResponse result = getClient().scan(scanRequest.build());
+		ScanResponse result = client().scan(scanRequest.build());
 		String lastKey = null;
 		LinkedList<P> results = new LinkedList<>();
 		for (Map<String, AttributeValue> item : result.items()) {
@@ -717,7 +717,7 @@ public final class AWSDynamoUtils {
 			query.exclusiveStartKey(startKey);
 		}
 
-		return index != null ? getClient().query(query.indexName(index.indexName()).
+		return index != null ? client().query(query.indexName(index.indexName()).
 				tableName(getTableNameForAppid(Para.getConfig().sharedTableName())).build()) : null;
 	}
 
@@ -765,7 +765,7 @@ public final class AWSDynamoUtils {
 	 */
 	public static GlobalSecondaryIndexDescription getSharedGlobalIndex() {
 		try {
-			DescribeTableResponse t = getClient().describeTable(b ->
+			DescribeTableResponse t = client().describeTable(b ->
 					b.tableName(getTableNameForAppid(Para.getConfig().sharedTableName())));
 			return t.table().globalSecondaryIndexes().stream().
 					filter(gsi -> gsi.indexName().equals(getSharedIndexName())).findFirst().orElse(null);
@@ -784,25 +784,6 @@ public final class AWSDynamoUtils {
 		return Strings.CS.startsWith(appIdentifier, " ");
 	}
 
-	/**
-	 * Returns the list of regions where a table should be replicated (global table).
-	 * @return a list of regions
-	 */
-	public static List<String> getReplicaRegions() {
-		if (!StringUtils.isBlank(Para.getConfig().awsDynamoReplicaRegions()) && replicaRegions == null) {
-			replicaRegions = new LinkedList<String>();
-			String[] regions = Para.getConfig().awsDynamoReplicaRegions().split("\\s*,\\s*");
-			if (regions != null && regions.length > 0) {
-				for (String region : regions) {
-					if (!StringUtils.isBlank(region)) {
-						replicaRegions.add(region);
-					}
-				}
-			}
-		}
-		return Optional.ofNullable(replicaRegions).orElse(Collections.emptyList());
-	}
-
 	private static String getSharedIndexName() {
 		return "GSI_" + Para.getConfig().sharedTableName();
 	}
@@ -812,7 +793,7 @@ public final class AWSDynamoUtils {
 	}
 
 	private static void waitForActive(String table, String region) {
-		WaiterResponse<DescribeTableResponse> waiterResponse = getClient(region).waiter().
+		WaiterResponse<DescribeTableResponse> waiterResponse = AWSDynamoUtils.client(region).waiter().
 				waitUntilTableExists(r -> r.tableName(table));
 		if (!waiterResponse.matched().response().isPresent()) {
 			logger.warn("DynamoDB table {} did not become active!", table);
