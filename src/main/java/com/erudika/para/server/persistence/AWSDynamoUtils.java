@@ -45,7 +45,6 @@ import software.amazon.awssdk.services.applicationautoscaling.model.MetricType;
 import software.amazon.awssdk.services.applicationautoscaling.model.PolicyType;
 import software.amazon.awssdk.services.applicationautoscaling.model.ScalableDimension;
 import software.amazon.awssdk.services.applicationautoscaling.model.ServiceNamespace;
-import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
@@ -66,8 +65,8 @@ import software.amazon.awssdk.services.dynamodb.model.ProjectionType;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
-import software.amazon.awssdk.services.dynamodb.model.Replica;
-import software.amazon.awssdk.services.dynamodb.model.ReplicaUpdate;
+import software.amazon.awssdk.services.dynamodb.model.ReplicaStatus;
+import software.amazon.awssdk.services.dynamodb.model.ReplicationGroupUpdate;
 import software.amazon.awssdk.services.dynamodb.model.ReturnConsumedCapacity;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
@@ -202,17 +201,27 @@ public final class AWSDynamoUtils {
 		boolean replicate = !replicaRegions.isEmpty() && !App.isRoot(appid);
 		if (created && replicate) {
 			Para.asyncExecute(() -> {
-				List<Replica> replicas = new LinkedList<>();
-				// add master AND secondary replicas
-				replicas.add(Replica.builder().regionName(AWS_REGION).build());
-				// also create secondary replica tables, skipping the region of the master replica table
-				replicaRegions.stream().filter(r -> !r.equals(AWS_REGION)).forEach(region -> {
+				List<String> secondaryReplicaRegions = replicaRegions.stream().
+						filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
+				List<ReplicationGroupUpdate> replicaUpdates = new LinkedList<>();
+				secondaryReplicaRegions.forEach(region -> {
 					logger.info("Replicating DynamoDB table '{}' in region {}...", table, region);
-					replicas.add(Replica.builder().regionName(region).build());
-					createTableInternal(appid, maxReadCapacity, maxWriteCapacity, region);
+					replicaUpdates.add(ReplicationGroupUpdate.builder().
+							create(r -> r.regionName(region)).build());
 				});
-				// link master and secondary tables together in a global table relationship (multi-master replicas)
-				client().createGlobalTable(b -> b.globalTableName(table).replicationGroup(replicas));
+				if (replicaUpdates.isEmpty()) {
+					return;
+				}
+				try {
+					client().updateTable(b -> b.tableName(table).replicaUpdates(replicaUpdates));
+					waitForReplicas(table, secondaryReplicaRegions, true);
+					if (Para.getConfig().awsDynamoProvisionedBillingEnabled()) {
+						secondaryReplicaRegions.forEach(region ->
+								enableAutoscaling(table, maxReadCapacity, maxWriteCapacity, region));
+					}
+				} catch (Exception e) {
+					logger.error("Failed to create DynamoDB global table replicas for '{}'.", table, e);
+				}
 			});
 		}
 		if (Para.getConfig().awsDynamoBackupsEnabled()) {
@@ -249,35 +258,7 @@ public final class AWSDynamoUtils {
 			logger.info("Created DynamoDB table '{}', status {}.", table, tbl.tableDescription().tableStatus());
 
 			if (replicate && Para.getConfig().awsDynamoProvisionedBillingEnabled()) {
-				logger.info("Enabling autoscaling for DynamoDB table '{}'...", table);
-				ApplicationAutoScalingClient aasClient = getAutoScalingClient(region);
-				aasClient.registerScalableTarget(t -> t.serviceNamespace(ServiceNamespace.DYNAMODB).
-						resourceId("table/" + table).
-						scalableDimension(ScalableDimension.DYNAMODB_TABLE_READ_CAPACITY_UNITS).
-						minCapacity(1).maxCapacity((int) maxReadCapacity));
-				aasClient.registerScalableTarget(t -> t.serviceNamespace(ServiceNamespace.DYNAMODB).
-						resourceId("table/" + table).
-						scalableDimension(ScalableDimension.DYNAMODB_TABLE_WRITE_CAPACITY_UNITS).
-						minCapacity(1).maxCapacity((int) maxWriteCapacity));
-				aasClient.putScalingPolicy(s -> s.policyName(table + "-autoscale-reads").
-						resourceId("table/" + table).
-						serviceNamespace(ServiceNamespace.DYNAMODB).
-						scalableDimension(ScalableDimension.DYNAMODB_TABLE_READ_CAPACITY_UNITS).
-						policyType(PolicyType.TARGET_TRACKING_SCALING).
-						targetTrackingScalingPolicyConfiguration(t
-								-> t.predefinedMetricSpecification(p -> p.
-						predefinedMetricType(MetricType.DYNAMO_DB_READ_CAPACITY_UTILIZATION)).
-								targetValue(70.0).scaleInCooldown(60).scaleOutCooldown(60)));
-				aasClient.putScalingPolicy(s -> s.policyName(table + "-autoscale-writes").
-						resourceId("table/" + table).
-						serviceNamespace(ServiceNamespace.DYNAMODB).
-						scalableDimension(ScalableDimension.DYNAMODB_TABLE_WRITE_CAPACITY_UNITS).
-						policyType(PolicyType.TARGET_TRACKING_SCALING).
-						targetTrackingScalingPolicyConfiguration(t
-								-> t.predefinedMetricSpecification(p -> p.
-						predefinedMetricType(MetricType.DYNAMO_DB_WRITE_CAPACITY_UTILIZATION)).
-								targetValue(70.0).scaleInCooldown(60).scaleOutCooldown(60)));
-				waitForActive(table, region);
+				enableAutoscaling(table, maxReadCapacity, maxWriteCapacity, region);
 			}
 		} catch (Exception e) {
 			logger.error(null, e);
@@ -323,27 +304,20 @@ public final class AWSDynamoUtils {
 			String table = getTableNameForAppid(appid);
 			List<String> replicaRegions = Para.getConfig().replicaRegions();
 			if (!replicaRegions.isEmpty() && !App.isRoot(appid)) {
-				List<ReplicaUpdate> replicaUpdates = new LinkedList<>();
-				replicaRegions.stream().forEach(region -> {
+				List<String> secondaryReplicaRegions = replicaRegions.stream().
+						filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
+				List<ReplicationGroupUpdate> replicaUpdates = new LinkedList<>();
+				secondaryReplicaRegions.forEach(region -> {
 					logger.info("Removing replica from global table '{}' in region {}...", table, region);
-					replicaUpdates.add(ReplicaUpdate.builder().delete(d -> d.regionName(region)).build());
+					replicaUpdates.add(ReplicationGroupUpdate.builder().delete(d -> d.regionName(region)).build());
 				});
-				try {
-					// this only removes the replicas for each region - it DOES NOT delete the actual replica tables
-					client().updateGlobalTable(b -> b.globalTableName(table).replicaUpdates(replicaUpdates));
-				} catch (Exception ex) {
-					logger.error(null, ex);
-				} finally {
-					replicaRegions.stream().forEach(region -> {
-						DynamoDbAsyncClient asyncdb = DynamoDbAsyncClient.builder().region(Region.of(region)).build();
-						asyncdb.deleteTable(b -> b.tableName(table));
-						logger.info("Deleted DynamoDB table '{}' in region {}.", table, region);
-					});
+				if (!replicaUpdates.isEmpty()) {
+					client().updateTable(b -> b.tableName(table).replicaUpdates(replicaUpdates));
+					waitForReplicas(table, secondaryReplicaRegions, false);
 				}
-			} else {
-				client().deleteTable(b -> b.tableName(table));
-				logger.info("Deleted DynamoDB table '{}'.", table);
 			}
+			client().deleteTable(b -> b.tableName(table));
+			logger.info("Deleted DynamoDB table '{}'.", table);
 		} catch (Exception e) {
 			logger.error(null, e);
 			return false;
@@ -798,6 +772,67 @@ public final class AWSDynamoUtils {
 		if (!waiterResponse.matched().response().isPresent()) {
 			logger.warn("DynamoDB table {} did not become active!", table);
 		}
+	}
+
+	private static void waitForReplicas(String table, List<String> replicaRegions, boolean active) {
+		if (replicaRegions == null || replicaRegions.isEmpty()) {
+			return;
+		}
+		int retries = 60;
+		while (retries-- > 0) {
+			try {
+				TableDescription tableDescription = client().describeTable(b -> b.tableName(table)).table();
+				List<String> matchedReplicas = tableDescription.replicas().stream().
+						filter(replica -> replicaRegions.contains(replica.regionName())).
+						filter(replica -> !active || ReplicaStatus.ACTIVE.equals(replica.replicaStatus())).
+						map(replica -> replica.regionName()).
+						collect(Collectors.toList());
+				if ((active && matchedReplicas.size() == replicaRegions.size()) ||
+						(!active && matchedReplicas.isEmpty())) {
+					return;
+				}
+				Thread.sleep(5000L);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				logger.warn("Interrupted while waiting for DynamoDB replicas for table '{}'.", table);
+				return;
+			} catch (Exception e) {
+				logger.warn("Failed to check DynamoDB replica status for table '{}': {}", table, e.getMessage());
+			}
+		}
+		logger.warn("Timed out waiting for DynamoDB replicas on table '{}'.", table);
+	}
+
+	private static void enableAutoscaling(String table, int maxReadCapacity, int maxWriteCapacity, String region) {
+		logger.info("Enabling autoscaling for DynamoDB table '{}' in region {}...", table, region);
+		ApplicationAutoScalingClient aasClient = getAutoScalingClient(region);
+		aasClient.registerScalableTarget(t -> t.serviceNamespace(ServiceNamespace.DYNAMODB).
+				resourceId("table/" + table).
+				scalableDimension(ScalableDimension.DYNAMODB_TABLE_READ_CAPACITY_UNITS).
+				minCapacity(1).maxCapacity(maxReadCapacity));
+		aasClient.registerScalableTarget(t -> t.serviceNamespace(ServiceNamespace.DYNAMODB).
+				resourceId("table/" + table).
+				scalableDimension(ScalableDimension.DYNAMODB_TABLE_WRITE_CAPACITY_UNITS).
+				minCapacity(1).maxCapacity(maxWriteCapacity));
+		aasClient.putScalingPolicy(s -> s.policyName(table + "-autoscale-reads").
+				resourceId("table/" + table).
+				serviceNamespace(ServiceNamespace.DYNAMODB).
+				scalableDimension(ScalableDimension.DYNAMODB_TABLE_READ_CAPACITY_UNITS).
+				policyType(PolicyType.TARGET_TRACKING_SCALING).
+				targetTrackingScalingPolicyConfiguration(t
+						-> t.predefinedMetricSpecification(p -> p.
+				predefinedMetricType(MetricType.DYNAMO_DB_READ_CAPACITY_UTILIZATION)).
+						targetValue(70.0).scaleInCooldown(60).scaleOutCooldown(60)));
+		aasClient.putScalingPolicy(s -> s.policyName(table + "-autoscale-writes").
+				resourceId("table/" + table).
+				serviceNamespace(ServiceNamespace.DYNAMODB).
+				scalableDimension(ScalableDimension.DYNAMODB_TABLE_WRITE_CAPACITY_UNITS).
+				policyType(PolicyType.TARGET_TRACKING_SCALING).
+				targetTrackingScalingPolicyConfiguration(t
+						-> t.predefinedMetricSpecification(p -> p.
+				predefinedMetricType(MetricType.DYNAMO_DB_WRITE_CAPACITY_UTILIZATION)).
+						targetValue(70.0).scaleInCooldown(60).scaleOutCooldown(60)));
+		waitForActive(table, region);
 	}
 
 	/**
