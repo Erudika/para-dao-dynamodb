@@ -200,29 +200,7 @@ public final class AWSDynamoUtils {
 		boolean created = createTableInternal(appid, maxReadCapacity, maxWriteCapacity, AWS_REGION); // master replica
 		boolean replicate = !replicaRegions.isEmpty() && !App.isRoot(appid);
 		if (created && replicate) {
-			Para.asyncExecute(() -> {
-				List<String> secondaryReplicaRegions = replicaRegions.stream().
-						filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
-				List<ReplicationGroupUpdate> replicaUpdates = new LinkedList<>();
-				secondaryReplicaRegions.forEach(region -> {
-					logger.info("Replicating DynamoDB table '{}' in region {}...", table, region);
-					replicaUpdates.add(ReplicationGroupUpdate.builder().
-							create(r -> r.regionName(region)).build());
-				});
-				if (replicaUpdates.isEmpty()) {
-					return;
-				}
-				try {
-					client().updateTable(b -> b.tableName(table).replicaUpdates(replicaUpdates));
-					waitForReplicas(table, secondaryReplicaRegions, true);
-					if (Para.getConfig().awsDynamoProvisionedBillingEnabled()) {
-						secondaryReplicaRegions.forEach(region ->
-								enableAutoscaling(table, maxReadCapacity, maxWriteCapacity, region));
-					}
-				} catch (Exception e) {
-					logger.error("Failed to create DynamoDB global table replicas for '{}'.", table, e);
-				}
-			});
+			Para.asyncExecute(() -> createReplicas(table, replicaRegions, maxReadCapacity, maxWriteCapacity));
 		}
 		if (Para.getConfig().awsDynamoBackupsEnabled()) {
 			logger.info("Enabling backups for table '{}'...", table);
@@ -302,20 +280,7 @@ public final class AWSDynamoUtils {
 		}
 		try {
 			String table = getTableNameForAppid(appid);
-			List<String> replicaRegions = Para.getConfig().replicaRegions();
-			if (!replicaRegions.isEmpty() && !App.isRoot(appid)) {
-				List<String> secondaryReplicaRegions = replicaRegions.stream().
-						filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
-				List<ReplicationGroupUpdate> replicaUpdates = new LinkedList<>();
-				secondaryReplicaRegions.forEach(region -> {
-					logger.info("Removing replica from global table '{}' in region {}...", table, region);
-					replicaUpdates.add(ReplicationGroupUpdate.builder().delete(d -> d.regionName(region)).build());
-				});
-				if (!replicaUpdates.isEmpty()) {
-					client().updateTable(b -> b.tableName(table).replicaUpdates(replicaUpdates));
-					waitForReplicas(table, secondaryReplicaRegions, false);
-				}
-			}
+			deleteReplicas(appid, table);
 			client().deleteTable(b -> b.tableName(table));
 			logger.info("Deleted DynamoDB table '{}'.", table);
 		} catch (Exception e) {
@@ -771,6 +736,47 @@ public final class AWSDynamoUtils {
 				waitUntilTableExists(r -> r.tableName(table));
 		if (!waiterResponse.matched().response().isPresent()) {
 			logger.warn("DynamoDB table {} did not become active!", table);
+		}
+	}
+
+	private static void createReplicas(String table, List<String> replicaRegions,
+			int maxReadCapacity, int maxWriteCapacity) {
+		List<String> secondaryReplicaRegions = replicaRegions.stream().
+				filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
+		if (secondaryReplicaRegions.isEmpty()) {
+			return;
+		}
+		try {
+			secondaryReplicaRegions.forEach(region -> {
+				logger.info("Replicating DynamoDB table '{}' in region {}...", table, region);
+				client().updateTable(b -> b.tableName(table).replicaUpdates(ReplicationGroupUpdate.builder().
+						create(r -> r.regionName(region)).build()));
+				waitForReplicas(table, Collections.singletonList(region), true);
+			});
+			if (Para.getConfig().awsDynamoProvisionedBillingEnabled()) {
+				secondaryReplicaRegions.forEach(region
+						-> enableAutoscaling(table, maxReadCapacity, maxWriteCapacity, region));
+			}
+		} catch (Exception e) {
+			logger.error("Failed to create DynamoDB global table replicas for '{}'.", table, e);
+		}
+	}
+
+	private static void deleteReplicas(String appid, String table) {
+		List<String> replicaRegions = Para.getConfig().replicaRegions();
+		if (!replicaRegions.isEmpty() && !App.isRoot(appid)) {
+			try {
+				List<String> secondaryReplicaRegions = replicaRegions.stream().
+						filter(region -> !region.equals(AWS_REGION)).collect(Collectors.toList());
+				secondaryReplicaRegions.forEach(region -> {
+					logger.info("Removing replica from global table '{}' in region {}...", table, region);
+					client().updateTable(b -> b.tableName(table).replicaUpdates(ReplicationGroupUpdate.builder().
+							delete(d -> d.regionName(region)).build()));
+					waitForReplicas(table, Collections.singletonList(region), false);
+				});
+			} catch (Exception e) {
+				logger.error("Failed to delete DynamoDB replicas for app '" + appid + "':", e);
+			}
 		}
 	}
 

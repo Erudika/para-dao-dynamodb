@@ -81,15 +81,13 @@ public class AWSDynamoDAO implements DAO {
 				if (app != null) {
 					if (app.isSharingTable()) {
 						final String appid = app.getAppIdentifier();
-						Para.asyncExecute(new Runnable() {
-							public void run() {
-								logger.info("Async deleteAllFromSharedTable({}) started.", appid);
-								AWSDynamoUtils.deleteAllFromSharedTable(appid);
-								logger.info("Finished deleteAllFromSharedTable({}).", appid);
-							}
+						Para.asyncExecute(() -> {
+							logger.info("Async deleteAllFromSharedTable({}) started.", appid);
+							AWSDynamoUtils.deleteAllFromSharedTable(appid);
+							logger.info("Finished deleteAllFromSharedTable({}).", appid);
 						});
 					} else {
-						AWSDynamoUtils.deleteTable(app.getAppIdentifier());
+						Para.asyncExecute(() -> AWSDynamoUtils.deleteTable(app.getAppIdentifier()));
 					}
 				}
 			});
