@@ -56,6 +56,7 @@ import software.amazon.awssdk.services.dynamodb.model.CreateTableResponse;
 import software.amazon.awssdk.services.dynamodb.model.DescribeTableResponse;
 import software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndex;
 import software.amazon.awssdk.services.dynamodb.model.GlobalSecondaryIndexDescription;
+import software.amazon.awssdk.services.dynamodb.model.GlobalTableSettingsReplicationMode;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
 import software.amazon.awssdk.services.dynamodb.model.KeysAndAttributes;
@@ -749,7 +750,9 @@ public final class AWSDynamoUtils {
 		try {
 			secondaryReplicaRegions.forEach(region -> {
 				logger.info("Replicating DynamoDB table '{}' in region {}...", table, region);
-				client().updateTable(b -> b.tableName(table).replicaUpdates(ReplicationGroupUpdate.builder().
+				client().updateTable(b -> b.tableName(table).
+						globalTableSettingsReplicationMode(GlobalTableSettingsReplicationMode.ENABLED).
+						replicaUpdates(ReplicationGroupUpdate.builder().
 						create(r -> r.regionName(region)).build()));
 				waitForReplicas(table, Collections.singletonList(region), true);
 			});
